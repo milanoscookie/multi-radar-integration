@@ -242,29 +242,45 @@ class TrackFusion:
 
         if not all_tracks:
             return []
+        n = len(all_tracks)
+
+        # If only one track, fast path
+        if n == 1:
+            return [self._ekf_update_single(all_tracks[0])]
 
         # Build distance matrix on positions (for quick clustering)
         positions = np.array([[t['posX'], t['posY'], t['posZ']] for t in all_tracks], dtype=float)
         dist_matrix = cdist(positions, positions, metric='euclidean')
 
         fused_tracks = []
-        merged_indices = set()
+        visited = set()
 
-        for i, track_i in enumerate(all_tracks):
-            if i in merged_indices:
+        # Connected components: any tracks transitively within threshold get merged
+        for i in range(n):
+            if i in visited:
                 continue
 
-            close_idx = np.where(dist_matrix[i, :] < self.distance_threshold)[0]
-            cluster = [all_tracks[idx] for idx in close_idx if idx not in merged_indices]
+            stack = [i]
+            cluster_indices = []
+
+            while stack:
+                cur = stack.pop()
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                cluster_indices.append(cur)
+
+                neighbors = np.where(dist_matrix[cur, :] < self.distance_threshold)[0]
+                for nb in neighbors:
+                    if nb != cur and nb not in visited:
+                        stack.append(nb)
+
+            cluster = [all_tracks[idx] for idx in cluster_indices]
 
             if len(cluster) > 1:
-                fused = self._ekf_fuse_cluster(cluster)
-                fused_tracks.append(fused)
-                merged_indices.update(close_idx)
+                fused_tracks.append(self._ekf_fuse_cluster(cluster))
             else:
-                fused = self._ekf_update_single(track_i)
-                fused_tracks.append(fused)
-                merged_indices.add(i)
+                fused_tracks.append(self._ekf_update_single(cluster[0]))
 
         return fused_tracks
 
