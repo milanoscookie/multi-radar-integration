@@ -281,6 +281,9 @@ class TrackFusion:
         self.filters = {}                  # global_tid -> EKFTrack
         self.global_tid_last_ts = {}       # global_tid -> last measurement timestamp
 
+        # Debug mode
+        self.debug = self.fusion_cfg.get('debug', False)
+
         self._log('Track Fusion (EKF-CA) initialized with track lock-in and split detection')
 
     def fuse_tracks(self, radar_frames):
@@ -325,11 +328,20 @@ class TrackFusion:
                 gid = self.radar_to_global_tid[key]
                 if gid in self.filters:
                     established_measurements.append((idx, gid))
+                    if self.debug:
+                        self._log(f'  ESTABLISHED: {key} -> GID {gid}')
                 else:
                     # Filter was cleaned up, treat as new
                     new_measurements.append(idx)
+                    if self.debug:
+                        self._log(f'  NEW (filter cleaned): {key}')
             else:
                 new_measurements.append(idx)
+                if self.debug:
+                    self._log(f'  NEW: {key}')
+        
+        if self.debug:
+            self._log(f'  Established: {len(established_measurements)}, New: {len(new_measurements)}')
 
         fused_tracks = []
         processed_indices = set()
@@ -370,11 +382,20 @@ class TrackFusion:
 
             # Check if any existing tracks are close to each other (conflict zone)
             conflict_zone = self._detect_conflict_zones(existing_track_positions)
+            
+            if self.debug:
+                self._log(f'  Existing tracks: {list(existing_track_positions.keys())}')
+                self._log(f'  Conflict zones: {conflict_zone}')
 
             # Process new measurements
             new_clusters = self._associate_new_measurements(
                 all_tracks, new_measurements, existing_track_positions, conflict_zone
             )
+            
+            if self.debug:
+                for ci, cluster_indices in enumerate(new_clusters):
+                    radars = [all_tracks[idx]['radar_name'] for idx in cluster_indices]
+                    self._log(f'  New cluster {ci}: indices={cluster_indices}, radars={radars}')
 
             for cluster_indices in new_clusters:
                 # Skip if any index in this cluster was already processed
@@ -615,6 +636,8 @@ class TrackFusion:
                 pos_dist = np.linalg.norm(pos_i - pos_j)
 
                 if pos_dist > self.distance_threshold:
+                    if self.debug:
+                        self._log(f'    Reject merge {t_i["radar_name"]}:{t_i["tid"]} <-> {t_j["radar_name"]}:{t_j["tid"]}: pos_dist={pos_dist:.3f}m > {self.distance_threshold}m')
                     continue
 
                 # Check velocity consistency
@@ -623,8 +646,12 @@ class TrackFusion:
                 vel_dist = np.linalg.norm(vel_i - vel_j)
 
                 if vel_dist > self.velocity_threshold:
+                    if self.debug:
+                        self._log(f'    Reject merge {t_i["radar_name"]}:{t_i["tid"]} <-> {t_j["radar_name"]}:{t_j["tid"]}: vel_dist={vel_dist:.3f}m/s > {self.velocity_threshold}m/s')
                     continue
 
+                if self.debug:
+                    self._log(f'    Allow merge {t_i["radar_name"]}:{t_i["tid"]} <-> {t_j["radar_name"]}:{t_j["tid"]}: pos={pos_dist:.3f}m, vel={vel_dist:.3f}m/s')
                 can_merge[i, j] = True
                 can_merge[j, i] = True
 
