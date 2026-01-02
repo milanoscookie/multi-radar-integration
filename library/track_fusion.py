@@ -65,25 +65,68 @@ CONFIGURATION PARAMETERS (set in TRACK_FUSION_CFG dict):
    - INCREASE if radars have large position offsets or targets are sparse
    - DECREASE if targets are close together to avoid false associations
 
-7. tid_timeout (default: 2.0) - Track ID timeout [seconds]
+7. velocity_threshold (default: 1.0) - Velocity consistency threshold [m/s]
+   
+   Maximum velocity difference to consider two tracks as the same target.
+   This prevents merging tracks of two people walking in different directions
+   even if they are spatially close.
+   
+   - INCREASE if velocity measurements are noisy or unreliable
+   - DECREASE to be stricter about motion consistency (e.g., 0.5 for slow walkers)
+   - Set based on expected velocity measurement accuracy
+
+8. tid_timeout (default: 2.0) - Track ID timeout [seconds]
    
    How long to keep a track alive after last detection before deleting it.
    
    - INCREASE for intermittent detections or slow-moving targets
    - DECREASE for fast update rates or to quickly drop lost tracks
 
+9. min_track_separation (default: 0.3) - Minimum separation for conflict zones [m]
+    
+    When existing global tracks are closer than 3x this value (conflict zone),
+    new measurements in that area will NOT be cross-radar fused. This prevents
+    accidental merging when two people are close together.
+    
+    - INCREASE to create larger "no fusion" zones around close tracks
+    - DECREASE if fusion is being prevented in valid scenarios
+    - Note: Track identity is locked once established (via radar_to_global_tid mapping)
+
+10. split_distance_threshold (default: 0.8) - Track split position threshold [m]
+    
+    If measurements from different radars assigned to the SAME global track
+    are further apart than this distance, the track will be SPLIT into separate
+    tracks. This recovers from incorrect merges when two people separate.
+    
+    - INCREASE if tracks are splitting too aggressively (normal movement causes splits)
+    - DECREASE if merged tracks aren't splitting when people walk apart
+    - Should be larger than distance_threshold to avoid oscillation
+
+11. split_velocity_threshold (default: 0.8) - Track split velocity threshold [m/s]
+    
+    If measurements from different radars assigned to the SAME global track
+    have velocity differences larger than this, the track will be SPLIT.
+    This helps detect when merged people start moving in different directions.
+    
+    - INCREASE if tracks are splitting due to noisy velocity measurements
+    - DECREASE to be more sensitive to diverging motion
+
 EXAMPLE CONFIGURATION:
 ----------------------
 fusion_cfg = {
     'TRACK_FUSION_CFG': {
-        'distance_threshold': 0.5,   # meters
-        'sigma_j': 1.0,              # m/s^3 - increase for maneuvering targets
-        'meas_sigma_pos': 0.25,      # m - match to radar spec
-        'meas_sigma_vel': 0.50,      # m/s - match to radar spec
-        'meas_sigma_acc': 1.0,       # m/s^2 - usually higher uncertainty
+        'distance_threshold': 0.5,       # meters - for initial cross-radar fusion
+        'velocity_threshold': 1.0,       # m/s - velocity consistency for fusion
+        'min_track_separation': 0.3,     # meters - conflict zone threshold
+        'split_distance_threshold': 0.8, # meters - trigger split when measurements diverge
+        'split_velocity_threshold': 0.8, # m/s - trigger split on velocity divergence
+        'sigma_j': 1.0,                  # m/s^3 - increase for maneuvering targets
+        'meas_sigma_pos': 0.25,          # m - match to radar spec
+        'meas_sigma_vel': 0.50,          # m/s - match to radar spec
+        'meas_sigma_acc': 1.0,           # m/s^2 - usually higher uncertainty
         'use_mahalanobis_gating': True,
-        'mahalanobis_gate': 22.0,    # chi2(9) @ 99%
-        'tid_timeout': 2.0,          # seconds
+        'mahalanobis_gate': 22.0,        # chi2(9) @ 99%
+        'tid_timeout': 2.0,              # seconds
     },
     'RADAR_CFG_LIST': [...]
 }
@@ -101,7 +144,6 @@ TUNING TIPS:
 """
 
 import numpy as np
-from scipy.spatial.distance import cdist
 import time
 
 
@@ -119,7 +161,6 @@ class EKFTrack:
         self.x = _as_col(x0)              # (9,1)
         self.P = np.array(P0, dtype=float)  # (9,9)
         self.sigma_j = float(sigma_j)     # jerk std deviation (m/s^3)
-        self.last_ts = None
 
     def predict(self, dt):
         dt = float(max(dt, 0.0))
@@ -203,6 +244,10 @@ class TrackFusion:
         # Original knobs (still supported)
         self.distance_threshold = self.fusion_cfg.get('distance_threshold', 0.5)  # meters
 
+        # Velocity consistency threshold for association
+        # Two tracks only merge if velocity difference < this threshold
+        self.velocity_threshold = self.fusion_cfg.get('velocity_threshold', 1.0)  # m/s
+
         # EKF knobs (CA model)
         self.sigma_j = self.fusion_cfg.get('sigma_j', 1.0)    # m/s^3 process jerk std
         self.meas_sigma_pos = self.fusion_cfg.get('meas_sigma_pos', 0.25)  # m
@@ -217,19 +262,46 @@ class TrackFusion:
         self.global_tid_last_seen = {}     # global_tid -> time.time()
         self.tid_timeout = float(self.fusion_cfg.get('tid_timeout', 2.0))
 
+        # Track association lock-in is implicit:
+        # Once a (radar_name, local_tid) is mapped to a global_tid in radar_to_global_tid,
+        # that association is LOCKED until the global track times out.
+        # This prevents track hijacking when people get close.
+        
+        # Minimum separation distance to PREVENT fusion
+        # If two existing global tracks are closer than this, DON'T fuse new measurements into them
+        self.min_track_separation = float(self.fusion_cfg.get('min_track_separation', 0.3))  # meters
+
+        # Track splitting parameters
+        # If measurements from different radars assigned to the SAME global track
+        # are further apart than this, trigger a split
+        self.split_distance_threshold = float(self.fusion_cfg.get('split_distance_threshold', 0.8))  # meters
+        self.split_velocity_threshold = float(self.fusion_cfg.get('split_velocity_threshold', 0.8))  # m/s
+
         # Global EKF bank
         self.filters = {}                  # global_tid -> EKFTrack
         self.global_tid_last_ts = {}       # global_tid -> last measurement timestamp
 
-        self._log('Track Fusion (EKF-CA) initialized')
+        self._log('Track Fusion (EKF-CA) initialized with track lock-in and split detection')
 
     def fuse_tracks(self, radar_frames):
+        """
+        Main fusion method with TRACK IDENTITY PRESERVATION:
+        
+        Key principle: Once a local track ID is associated with a global track,
+        that association is LOCKED and cannot be changed by proximity to other tracks.
+        
+        Algorithm:
+        1. For each measurement, check if its (radar, local_tid) already has a global association
+        2. If YES -> update that global track (no cross-radar fusion allowed for established tracks)
+        3. If NO -> this is a NEW track, try to find cross-radar matches for initial fusion
+        4. Prevent fusion when existing global tracks are too close to each other
+        """
         if not radar_frames:
             return []
 
         self._cleanup_old_tids()
 
-        # Flatten measurements
+        # Flatten measurements from all radars
         all_tracks = []
         for frame in radar_frames:
             radar_name = frame['radar_name']
@@ -242,49 +314,449 @@ class TrackFusion:
 
         if not all_tracks:
             return []
-        n = len(all_tracks)
 
-        # If only one track, fast path
-        if n == 1:
-            return [self._ekf_update_single(all_tracks[0])]
+        # Separate measurements into ESTABLISHED (have global association) and NEW
+        established_measurements = []  # [(idx, gid), ...]
+        new_measurements = []          # [idx, ...]
 
-        # Build distance matrix on positions (for quick clustering)
-        positions = np.array([[t['posX'], t['posY'], t['posZ']] for t in all_tracks], dtype=float)
-        dist_matrix = cdist(positions, positions, metric='euclidean')
+        for idx, track in enumerate(all_tracks):
+            key = (track['radar_name'], track['tid'])
+            if key in self.radar_to_global_tid:
+                gid = self.radar_to_global_tid[key]
+                if gid in self.filters:
+                    established_measurements.append((idx, gid))
+                else:
+                    # Filter was cleaned up, treat as new
+                    new_measurements.append(idx)
+            else:
+                new_measurements.append(idx)
 
         fused_tracks = []
-        visited = set()
+        processed_indices = set()
 
-        # Connected components: any tracks transitively within threshold get merged
-        for i in range(n):
-            if i in visited:
+        # STEP 1: Process ESTABLISHED measurements - each goes to its own global track
+        # Group by global_tid in case multiple radars see the same target
+        gid_to_indices = {}
+        for idx, gid in established_measurements:
+            gid_to_indices.setdefault(gid, []).append(idx)
+            processed_indices.add(idx)
+
+        for gid, indices in gid_to_indices.items():
+            cluster = [all_tracks[idx] for idx in indices]
+            
+            # CHECK FOR TRACK SPLIT: If multiple radars are updating this track
+            # but their measurements are far apart, we need to split
+            if len(cluster) >= 2:
+                split_result = self._check_and_split_track(gid, cluster)
+                if split_result is not None:
+                    # Track was split - split_result contains the new fused tracks
+                    fused_tracks.extend(split_result)
+                    continue
+            
+            # Normal update (no split needed)
+            if len(cluster) == 1:
+                fused_tracks.append(self._ekf_update_single_with_gid(cluster[0], gid))
+            else:
+                fused_tracks.append(self._ekf_fuse_cluster_with_gid(cluster, gid))
+
+        # STEP 2: For NEW measurements, check if cross-radar fusion is possible
+        # BUT only if there are no existing global tracks nearby (to prevent hijacking)
+        if new_measurements:
+            # Get positions of all existing global tracks for proximity check
+            existing_track_positions = {}
+            for gid, ekf in self.filters.items():
+                x = ekf.x.squeeze()
+                existing_track_positions[gid] = np.array([x[0], x[1], x[2]])
+
+            # Check if any existing tracks are close to each other (conflict zone)
+            conflict_zone = self._detect_conflict_zones(existing_track_positions)
+
+            # Process new measurements
+            new_clusters = self._associate_new_measurements(
+                all_tracks, new_measurements, existing_track_positions, conflict_zone
+            )
+
+            for cluster_indices in new_clusters:
+                # Skip if any index in this cluster was already processed
+                if any(idx in processed_indices for idx in cluster_indices):
+                    continue
+                
+                # Mark all indices as processed
+                for idx in cluster_indices:
+                    processed_indices.add(idx)
+
+                cluster = [all_tracks[idx] for idx in cluster_indices]
+                
+                if len(cluster) == 1:
+                    fused_tracks.append(self._ekf_update_single(cluster[0]))
+                else:
+                    # Only fuse if from different radars
+                    radars = set(t['radar_name'] for t in cluster)
+                    if len(radars) >= 2:
+                        fused_tracks.append(self._ekf_fuse_cluster(cluster))
+                    else:
+                        # Same radar - should not happen, but handle gracefully
+                        for t in cluster:
+                            fused_tracks.append(self._ekf_update_single(t))
+
+        return fused_tracks
+
+    def _check_and_split_track(self, gid, cluster):
+        """
+        Check if a global track should be split because measurements from different
+        radars have diverged (indicating two people who were merged are now separating).
+        
+        Args:
+            gid: The global track ID
+            cluster: List of measurements from different radars assigned to this track
+            
+        Returns:
+            None if no split needed, or list of fused_tracks if split occurred
+        """
+        if len(cluster) < 2:
+            return None
+        
+        # Group measurements by radar
+        by_radar = {}
+        for t in cluster:
+            by_radar.setdefault(t['radar_name'], []).append(t)
+        
+        if len(by_radar) < 2:
+            # All from same radar - can't split
+            return None
+        
+        # Get representative position for each radar (use highest confidence if multiple)
+        radar_positions = {}
+        radar_velocities = {}
+        radar_tracks = {}
+        
+        for radar_name, tracks in by_radar.items():
+            best = max(tracks, key=lambda t: t.get('confidence', 0.5))
+            radar_positions[radar_name] = np.array([best['posX'], best['posY'], best['posZ']])
+            radar_velocities[radar_name] = np.array([
+                best.get('velX', 0), best.get('velY', 0), best.get('velZ', 0)
+            ])
+            radar_tracks[radar_name] = best
+        
+        # Check if any pair of radars has diverging measurements
+        radar_names = list(radar_positions.keys())
+        max_pos_dist = 0
+        max_vel_dist = 0
+        
+        for i, r1 in enumerate(radar_names):
+            for r2 in radar_names[i+1:]:
+                pos_dist = np.linalg.norm(radar_positions[r1] - radar_positions[r2])
+                vel_dist = np.linalg.norm(radar_velocities[r1] - radar_velocities[r2])
+                
+                max_pos_dist = max(max_pos_dist, pos_dist)
+                max_vel_dist = max(max_vel_dist, vel_dist)
+        
+        # Check if split is needed
+        needs_split = (max_pos_dist > self.split_distance_threshold or 
+                       max_vel_dist > self.split_velocity_threshold)
+        
+        if not needs_split:
+            return None
+        
+        # SPLIT THE TRACK
+        self._log(f'SPLIT detected for GID {gid}: pos_dist={max_pos_dist:.2f}m, vel_dist={max_vel_dist:.2f}m/s')
+        
+        # Strategy: Keep the original GID for the radar with the oldest association,
+        # create new GIDs for other radars
+        fused_results = []
+        
+        # Find which radar had the original association (check association order)
+        original_radar = None
+        for radar_name in radar_names:
+            key = (radar_name, radar_tracks[radar_name]['tid'])
+            if key in self.radar_to_global_tid and self.radar_to_global_tid[key] == gid:
+                # This radar was associated with this gid
+                if original_radar is None:
+                    original_radar = radar_name
+                    break
+        
+        if original_radar is None:
+            original_radar = radar_names[0]
+        
+        # Process each radar's measurements separately
+        for radar_name, tracks in by_radar.items():
+            if radar_name == original_radar:
+                # Keep original GID for this radar
+                if len(tracks) == 1:
+                    fused_results.append(self._ekf_update_single_with_gid(tracks[0], gid))
+                else:
+                    fused_results.append(self._ekf_fuse_cluster_with_gid(tracks, gid))
+            else:
+                # Create new GID for this radar - break the association
+                for t in tracks:
+                    key = (t['radar_name'], t['tid'])
+                    # Remove old association
+                    if key in self.radar_to_global_tid:
+                        del self.radar_to_global_tid[key]
+                    # Create as new track
+                    fused_results.append(self._ekf_update_single(t))
+        
+        return fused_results
+
+    def _detect_conflict_zones(self, existing_track_positions):
+        """
+        Detect areas where multiple existing global tracks are close together.
+        In these zones, we should NOT allow new cross-radar fusion to prevent
+        accidentally merging distinct people.
+        
+        Returns: set of (gid1, gid2) pairs that are in conflict
+        """
+        conflicts = set()
+        gids = list(existing_track_positions.keys())
+        
+        for i, gid1 in enumerate(gids):
+            for gid2 in gids[i+1:]:
+                pos1 = existing_track_positions[gid1]
+                pos2 = existing_track_positions[gid2]
+                dist = np.linalg.norm(pos1 - pos2)
+                
+                if dist < self.min_track_separation * 3:  # Conflict zone is 3x min separation
+                    conflicts.add((min(gid1, gid2), max(gid1, gid2)))
+        
+        return conflicts
+
+    def _associate_new_measurements(self, all_tracks, new_indices, existing_positions, conflict_zone):
+        """
+        Associate new measurements, with awareness of conflict zones.
+        
+        Rules:
+        1. If a new measurement is near an existing track that's in a conflict zone,
+           DON'T fuse it cross-radar - let each radar maintain its own track
+        2. Only allow cross-radar fusion in "clear" areas
+        """
+        if not new_indices:
+            return []
+
+        # Check which new measurements are in conflict zones
+        in_conflict = set()
+        for idx in new_indices:
+            t = all_tracks[idx]
+            pos = np.array([t['posX'], t['posY'], t['posZ']])
+            
+            for gid, gpos in existing_positions.items():
+                dist = np.linalg.norm(pos - gpos)
+                if dist < self.min_track_separation * 2:
+                    # Check if this gid is involved in any conflict
+                    for g1, g2 in conflict_zone:
+                        if gid == g1 or gid == g2:
+                            in_conflict.add(idx)
+                            break
+
+        # Measurements in conflict zones become individual tracks (no cross-radar fusion)
+        clusters = []
+        for idx in new_indices:
+            if idx in in_conflict:
+                clusters.append([idx])
                 continue
 
-            stack = [i]
-            cluster_indices = []
+        # For non-conflict measurements, apply normal cross-radar association
+        safe_indices = [idx for idx in new_indices if idx not in in_conflict]
+        
+        if not safe_indices:
+            return clusters
+
+        # Group by radar
+        by_radar = {}
+        for idx in safe_indices:
+            r = all_tracks[idx]['radar_name']
+            by_radar.setdefault(r, []).append(idx)
+
+        # Cross-radar association with position + velocity consistency
+        safe_clusters = self._cross_radar_associate(all_tracks, by_radar)
+        clusters.extend(safe_clusters)
+
+        return clusters
+
+    def _cross_radar_associate(self, all_tracks, by_radar):
+        """
+        Associate unassociated measurements across different radars.
+        Only creates clusters from measurements belonging to DIFFERENT radars.
+        Uses both position and velocity consistency.
+        """
+        radar_names = list(by_radar.keys())
+        if len(radar_names) < 2:
+            # No cross-radar fusion possible, return each as individual
+            return [[idx] for indices in by_radar.values() for idx in indices]
+
+        # Collect all unassociated indices
+        all_unassoc = []
+        for indices in by_radar.values():
+            all_unassoc.extend(indices)
+
+        if not all_unassoc:
+            return []
+
+        n = len(all_unassoc)
+        if n == 1:
+            return [all_unassoc]
+
+        # Build affinity matrix: can only link if DIFFERENT radar AND consistent pos+vel
+        can_merge = np.zeros((n, n), dtype=bool)
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                idx_i = all_unassoc[i]
+                idx_j = all_unassoc[j]
+                t_i = all_tracks[idx_i]
+                t_j = all_tracks[idx_j]
+
+                # CRITICAL: Only allow merge if from DIFFERENT radars
+                if t_i['radar_name'] == t_j['radar_name']:
+                    continue
+
+                # Check position consistency
+                pos_i = np.array([t_i['posX'], t_i['posY'], t_i['posZ']])
+                pos_j = np.array([t_j['posX'], t_j['posY'], t_j['posZ']])
+                pos_dist = np.linalg.norm(pos_i - pos_j)
+
+                if pos_dist > self.distance_threshold:
+                    continue
+
+                # Check velocity consistency
+                vel_i = np.array([t_i.get('velX', 0), t_i.get('velY', 0), t_i.get('velZ', 0)])
+                vel_j = np.array([t_j.get('velX', 0), t_j.get('velY', 0), t_j.get('velZ', 0)])
+                vel_dist = np.linalg.norm(vel_i - vel_j)
+
+                if vel_dist > self.velocity_threshold:
+                    continue
+
+                can_merge[i, j] = True
+                can_merge[j, i] = True
+
+        # Connected components on the affinity graph
+        visited = set()
+        clusters = []
+
+        for start in range(n):
+            if start in visited:
+                continue
+
+            cluster = []
+            stack = [start]
 
             while stack:
                 cur = stack.pop()
                 if cur in visited:
                     continue
                 visited.add(cur)
-                cluster_indices.append(cur)
+                cluster.append(all_unassoc[cur])  # Store original index
 
-                neighbors = np.where(dist_matrix[cur, :] < self.distance_threshold)[0]
-                for nb in neighbors:
-                    if nb != cur and nb not in visited:
+                for nb in range(n):
+                    if nb not in visited and can_merge[cur, nb]:
                         stack.append(nb)
 
-            cluster = [all_tracks[idx] for idx in cluster_indices]
-
+            # Validate cluster: should contain tracks from at least 2 radars if merged
             if len(cluster) > 1:
-                fused_tracks.append(self._ekf_fuse_cluster(cluster))
+                radars_in_cluster = set(all_tracks[idx]['radar_name'] for idx in cluster)
+                if len(radars_in_cluster) >= 2:
+                    clusters.append(cluster)
+                else:
+                    # Split back to individuals (shouldn't happen due to logic above)
+                    for idx in cluster:
+                        clusters.append([idx])
             else:
-                fused_tracks.append(self._ekf_update_single(cluster[0]))
+                clusters.append(cluster)
 
-        return fused_tracks
+        return clusters
 
     # ---------- EKF-based fusion helpers ----------
+
+    def _ekf_update_single_with_gid(self, track, gid):
+        """
+        Update an existing global track with a measurement.
+        The global_tid is already known (locked association).
+        """
+        if gid not in self.filters:
+            self._init_filter_from_track(track, gid)
+
+        self._predict_to(gid, track['timestamp'])
+        z, R, meas_type = self._measurement_and_R(track)
+        nis = self.filters[gid].update(z, R, meas_type=meas_type)
+
+        est = self.filters[gid].get_state()
+        
+        fused_track = track.copy()
+        fused_track.update(est)
+        fused_track['global_tid'] = gid
+        fused_track['num_radars_detected'] = 1
+        fused_track['source_radars'] = [track['radar_name']]
+        fused_track['source_tids'] = [(track['radar_name'], track['tid'])]
+        fused_track['timestamp'] = float(track['timestamp'])
+        fused_track['P_trace'] = float(np.trace(self.filters[gid].P))
+        fused_track['nis'] = nis
+        
+        self.global_tid_last_seen[gid] = time.time()
+        return fused_track
+
+    def _ekf_fuse_cluster_with_gid(self, tracks, gid):
+        """
+        Fuse multiple measurements into an existing global track.
+        The global_tid is already known (locked association).
+        """
+        if len(tracks) == 1:
+            return self._ekf_update_single_with_gid(tracks[0], gid)
+
+        if gid not in self.filters:
+            best = max(tracks, key=lambda t: t.get('confidence', 0.5))
+            self._init_filter_from_track(best, gid)
+
+        ts = float(np.mean([t['timestamp'] for t in tracks]))
+        self._predict_to(gid, ts)
+
+        used = []
+        gated_out = []
+        for t in sorted(tracks, key=lambda x: x.get('confidence', 0.5), reverse=True):
+            z, R, meas_type = self._measurement_and_R(t)
+
+            if self.use_mahalanobis_gating:
+                if meas_type == 'pos_vel_acc':
+                    H = np.eye(9)
+                elif meas_type == 'pos_vel':
+                    H = np.zeros((6, 9))
+                    H[0, 0] = 1; H[1, 1] = 1; H[2, 2] = 1
+                    H[3, 3] = 1; H[4, 4] = 1; H[5, 5] = 1
+                else:
+                    H = np.zeros((3, 9))
+                    H[0, 0] = 1; H[1, 1] = 1; H[2, 2] = 1
+
+                x_pred = self.filters[gid].x
+                P_pred = self.filters[gid].P
+                hx = H @ x_pred
+                y = _as_col(z) - hx
+                S = H @ P_pred @ H.T + R
+                nis = float((y.T @ np.linalg.inv(S) @ y).squeeze())
+
+                if nis > self.mahalanobis_gate:
+                    gated_out.append((t['radar_name'], t['tid'], nis))
+                    continue
+
+            nis = self.filters[gid].update(z, R, meas_type=meas_type)
+            used.append((t['radar_name'], t['tid'], nis))
+
+        est = self.filters[gid].get_state()
+        confidences = np.array([t.get('confidence', 0.5) for t in tracks], dtype=float)
+        fused_confidence = float(np.max(confidences)) if len(confidences) else 0.5
+
+        fused_track = {
+            **est,
+            'confidence': fused_confidence,
+            'global_tid': gid,
+            'num_radars_detected': len(tracks),
+            'source_radars': [t['radar_name'] for t in tracks],
+            'source_tids': [(t['radar_name'], t['tid']) for t in tracks],
+            'timestamp': ts,
+            'P_trace': float(np.trace(self.filters[gid].P)),
+            'ekf_updates_used': used,
+            'ekf_gated_out': gated_out,
+        }
+
+        self.global_tid_last_seen[gid] = time.time()
+        return fused_track
 
     def _init_filter_from_track(self, track, global_tid):
         x0 = np.array([
@@ -539,15 +1011,33 @@ class TrackFusionVisualizer:
 if __name__ == '__main__':
     fusion_cfg = {
         'TRACK_FUSION_CFG': {
-            'distance_threshold': 0.5,
-            'sigma_a': 2.0,
-            'meas_sigma_pos': 0.25,
-            'meas_sigma_vel': 0.50,
+            # Association thresholds (for NEW tracks to merge cross-radar)
+            'distance_threshold': 0.5,      # meters - max position distance
+            'velocity_threshold': 1.0,      # m/s - max velocity difference
+            
+            # Track identity preservation (prevents merging when close)
+            'min_track_separation': 0.3,    # meters - conflict zone threshold
+            
+            # Track splitting (recovers from incorrect merges)
+            'split_distance_threshold': 0.8,  # meters - split when diverging
+            'split_velocity_threshold': 0.8,  # m/s - split on velocity divergence
+            
+            # EKF process noise (Constant Acceleration model)
+            'sigma_j': 1.0,                 # m/s^3 - jerk std dev
+            
+            # Measurement noise
+            'meas_sigma_pos': 0.25,         # meters
+            'meas_sigma_vel': 0.50,         # m/s
+            'meas_sigma_acc': 1.0,          # m/s^2
+            
+            # Outlier rejection
             'use_mahalanobis_gating': True,
-            'mahalanobis_gate': 16.0,
-            'tid_timeout': 2.0
+            'mahalanobis_gate': 22.0,       # chi2(9)@99% for full state gating
+            
+            # Track management
+            'tid_timeout': 2.0,             # seconds
         },
-        'RADAR_CFG_LIST': [{'name': 'Radar1'}, {'name': 'Radar2'}]
+        'RADAR_CFG_LIST': [{'name': 'Radar1'}, {'name': 'Radar2'}, {'name': 'Radar3'}]
     }
 
     fusion = TrackFusion(**fusion_cfg)
@@ -576,7 +1066,20 @@ if __name__ == '__main__':
         ]
     }
 
-    fused = fusion.fuse_tracks([frame1, frame2])
+    frame3 = {
+        'radar_name': 'Radar3',
+        'timestamp': t0 + 0.04,
+        'tracks': [
+            {'tid': 10, 'posX': 1.05, 'posY': 2.05, 'posZ': 1.45,
+             'velX': 0.12, 'velY': 0.19, 'velZ': 0.0,
+             'confidence': 0.88},
+            {'tid': 11, 'posX': 5.0, 'posY': 6.0, 'posZ': 1.0,
+             'velX': 0.5, 'velY': -0.3, 'velZ': 0.0,
+             'confidence': 0.75}
+        ]
+    }
+
+    fused = fusion.fuse_tracks([frame1, frame2, frame3])
     print(f'\nFused {len(fused)} tracks:')
     for tr in fused:
         print(f"  GID {tr['global_tid']}: "
@@ -584,5 +1087,6 @@ if __name__ == '__main__':
               f"Vel=({tr['velX']:.2f}, {tr['velY']:.2f}, {tr['velZ']:.2f}) "
               f"Conf={tr.get('confidence', 0.5):.2f} "
               f"P_tr={tr.get('P_trace', np.nan):.3f} "
-              f"radars={tr.get('num_radars_detected', 1)}")
+              f"radars={tr.get('num_radars_detected', 1)} "
+              f"sources={tr.get('source_radars', [])}")
 

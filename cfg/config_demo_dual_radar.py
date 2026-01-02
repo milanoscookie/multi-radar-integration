@@ -105,20 +105,46 @@ FRAME_POST_PROCESSOR_CFG = {
     'FPP_global_ylim' : (0, 10),
     'FPP_global_zlim' : (0.1, 3),
     
-    # Track fusion parameters
-    'track_fusion_distance_threshold': 0.5,  # meters - merge tracks closer than this
-    'track_id_offset'                : 1000, # Offset for radar 2 track IDs to avoid conflicts
+    # Track ID offset for radar 2 to avoid conflicts with radar 1 local IDs
+    'track_id_offset' : 1000,
 }
 
 # =============================================================================
-# TRACK FUSION CONFIG
+# TRACK FUSION CONFIG (EKF-CA Model with Track Identity Preservation)
 # =============================================================================
 TRACK_FUSION_CFG = {
     'enable'                  : True,
-    'distance_threshold'      : 0.5,   # meters - merge tracks within this distance
-    'confidence_weight'       : 0.7,   # Weight for track confidence in fusion
-    'velocity_weight'         : 0.3,   # Weight for velocity similarity
-    'fusion_method'           : 'weighted_average',  # or 'kalman'
+    
+    # Association thresholds (BOTH must be satisfied for NEW tracks to merge)
+    'distance_threshold'      : 0.5,   # meters - max position distance for initial fusion
+    'velocity_threshold'      : 1.0,   # m/s - max velocity difference for initial fusion
+    
+    # TRACK IDENTITY PRESERVATION (prevents merging when people get close)
+    # Once a local track is associated with a global track, that association is LOCKED
+    # until the track times out. New fusion only happens in "clear" areas.
+    'min_track_separation'    : 0.3,   # meters - if existing tracks are closer than 3x this,
+                                        #          new measurements won't be cross-radar fused
+    
+    # TRACK SPLITTING (recovers from incorrect merges)
+    # If measurements from different radars on the SAME global track diverge,
+    # the track will be split back into separate tracks
+    'split_distance_threshold': 0.8,   # meters - split if positions diverge more than this
+    'split_velocity_threshold': 0.8,   # m/s - split if velocities diverge more than this
+    
+    # EKF process noise (Constant Acceleration model)
+    'sigma_j'                 : 1.0,   # m/s^3 - jerk std dev (increase for maneuvering targets)
+    
+    # Measurement noise
+    'meas_sigma_pos'          : 0.25,  # meters - position measurement noise
+    'meas_sigma_vel'          : 0.50,  # m/s - velocity measurement noise
+    'meas_sigma_acc'          : 1.0,   # m/s^2 - acceleration measurement noise
+    
+    # Outlier rejection
+    'use_mahalanobis_gating'  : True,
+    'mahalanobis_gate'        : 22.0,  # chi2(9)@99% for full state gating
+    
+    # Track management
+    'tid_timeout'             : 2.0,   # seconds - drop track after no detections
 }
 
 # =============================================================================
