@@ -118,6 +118,10 @@ TRACK_FUSION_CFG = {
     # Association thresholds (BOTH must be satisfied for NEW tracks to merge)
     'distance_threshold'      : 0.5,   # meters - max position distance for initial fusion
     'velocity_threshold'      : 1.0,   # m/s - max velocity difference for initial fusion
+
+    'enable_late_fusion': True,       # Enable the fix (default: True)
+    'late_fusion_distance': 0.5,      # Max position distance for merge (meters)
+    'late_fusion_velocity': 1.0,      # Max velocity difference for merge (m/s)
     
     # TRACK IDENTITY PRESERVATION (prevents merging when people get close)
     # Once a local track is associated with a global track, that association is LOCKED

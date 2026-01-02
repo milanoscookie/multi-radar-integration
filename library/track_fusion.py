@@ -111,6 +111,29 @@ CONFIGURATION PARAMETERS (set in TRACK_FUSION_CFG dict):
     - INCREASE if tracks are splitting due to noisy velocity measurements
     - DECREASE to be more sensitive to diverging motion
 
+12. enable_late_fusion (default: True) - Enable late fusion for async radar detection
+    
+    When radars detect the same person at slightly different times, they get
+    assigned separate global TIDs. Late fusion detects this and merges them.
+    
+    - Set to True (default) to automatically merge tracks that should be together
+    - Set to False to disable (if you want strict per-radar tracking)
+
+13. late_fusion_distance (default: 0.5) - Late fusion position threshold [m]
+    
+    Maximum distance between two established tracks from DIFFERENT radars
+    for them to be merged via late fusion.
+    
+    - INCREASE if radars have larger position offsets
+    - DECREASE to be stricter about which tracks get merged
+
+14. late_fusion_velocity (default: 1.0) - Late fusion velocity threshold [m/s]
+    
+    Maximum velocity difference between two established tracks for late fusion.
+    
+    - INCREASE if velocity measurements are noisy
+    - DECREASE to require more consistent motion for fusion
+
 EXAMPLE CONFIGURATION:
 ----------------------
 fusion_cfg = {
@@ -120,6 +143,9 @@ fusion_cfg = {
         'min_track_separation': 0.3,     # meters - conflict zone threshold
         'split_distance_threshold': 0.8, # meters - trigger split when measurements diverge
         'split_velocity_threshold': 0.8, # m/s - trigger split on velocity divergence
+        'enable_late_fusion': True,      # merge tracks that were created separately
+        'late_fusion_distance': 0.5,     # meters - max distance for late fusion
+        'late_fusion_velocity': 1.0,     # m/s - max velocity diff for late fusion
         'sigma_j': 1.0,                  # m/s^3 - increase for maneuvering targets
         'meas_sigma_pos': 0.25,          # m - match to radar spec
         'meas_sigma_vel': 0.50,          # m/s - match to radar spec
@@ -277,6 +303,12 @@ class TrackFusion:
         self.split_distance_threshold = float(self.fusion_cfg.get('split_distance_threshold', 0.8))  # meters
         self.split_velocity_threshold = float(self.fusion_cfg.get('split_velocity_threshold', 0.8))  # m/s
 
+        # Late fusion: merge established tracks from different radars if they stay close
+        # This fixes the issue where radars detect the same person at slightly different times
+        self.enable_late_fusion = self.fusion_cfg.get('enable_late_fusion', True)
+        self.late_fusion_distance = float(self.fusion_cfg.get('late_fusion_distance', 0.5))  # meters
+        self.late_fusion_velocity = float(self.fusion_cfg.get('late_fusion_velocity', 1.0))  # m/s
+
         # Global EKF bank
         self.filters = {}                  # global_tid -> EKFTrack
         self.global_tid_last_ts = {}       # global_tid -> last measurement timestamp
@@ -342,6 +374,11 @@ class TrackFusion:
         
         if self.debug:
             self._log(f'  Established: {len(established_measurements)}, New: {len(new_measurements)}')
+
+        # STEP 0: LATE FUSION - Check if any established tracks from DIFFERENT radars
+        # should be merged (fixes async radar detection issue)
+        if self.enable_late_fusion and len(established_measurements) >= 2:
+            established_measurements = self._attempt_late_fusion(all_tracks, established_measurements)
 
         fused_tracks = []
         processed_indices = set()
@@ -518,6 +555,113 @@ class TrackFusion:
                     fused_results.append(self._ekf_update_single(t))
         
         return fused_results
+
+    def _attempt_late_fusion(self, all_tracks, established_measurements):
+        """
+        LATE FUSION: Merge established tracks from DIFFERENT radars if they are close.
+        
+        This fixes the async detection problem:
+        - Radar_A detects person first -> gets GID 1
+        - Radar_B detects same person 100ms later -> gets GID 2
+        - Now they're locked to separate GIDs forever
+        
+        Solution: If GID 1 and GID 2 are consistently close (same person), merge them.
+        """
+        # Group measurements by their current global_tid
+        gid_to_measurements = {}
+        for idx, gid in established_measurements:
+            gid_to_measurements.setdefault(gid, []).append((idx, all_tracks[idx]))
+        
+        if len(gid_to_measurements) < 2:
+            return established_measurements
+        
+        # Get current EKF positions for each GID
+        gid_positions = {}
+        gid_velocities = {}
+        gid_radars = {}
+        
+        for gid, measurements in gid_to_measurements.items():
+            if gid in self.filters:
+                x = self.filters[gid].x.squeeze()
+                gid_positions[gid] = np.array([x[0], x[1], x[2]])
+                gid_velocities[gid] = np.array([x[3], x[4], x[5]])
+            else:
+                # Use measurement position
+                t = measurements[0][1]
+                gid_positions[gid] = np.array([t['posX'], t['posY'], t['posZ']])
+                gid_velocities[gid] = np.array([t.get('velX', 0), t.get('velY', 0), t.get('velZ', 0)])
+            
+            # Track which radars contribute to this GID
+            gid_radars[gid] = set(t['radar_name'] for _, t in measurements)
+        
+        # Find pairs of GIDs that should be merged (different radars, close position/velocity)
+        gids = list(gid_to_measurements.keys())
+        merge_pairs = []
+        
+        for i, gid1 in enumerate(gids):
+            for gid2 in gids[i+1:]:
+                # Only merge if from DIFFERENT radars
+                if gid_radars[gid1] & gid_radars[gid2]:
+                    # Same radar appears in both - don't merge
+                    continue
+                
+                pos_dist = np.linalg.norm(gid_positions[gid1] - gid_positions[gid2])
+                vel_dist = np.linalg.norm(gid_velocities[gid1] - gid_velocities[gid2])
+                
+                if pos_dist <= self.late_fusion_distance and vel_dist <= self.late_fusion_velocity:
+                    merge_pairs.append((gid1, gid2, pos_dist, vel_dist))
+                    if self.debug:
+                        self._log(f'  LATE FUSION candidate: GID {gid1} + GID {gid2} '
+                                  f'(pos={pos_dist:.3f}m, vel={vel_dist:.3f}m/s)')
+        
+        if not merge_pairs:
+            return established_measurements
+        
+        # Process merges: keep the lower GID (older track), redirect higher GID
+        for gid1, gid2, pos_dist, vel_dist in merge_pairs:
+            keep_gid = min(gid1, gid2)
+            remove_gid = max(gid1, gid2)
+            
+            self._log(f'LATE FUSION: Merging GID {remove_gid} into GID {keep_gid} '
+                      f'(pos={pos_dist:.3f}m, vel={vel_dist:.3f}m/s)')
+            
+            # Update all radar->global mappings that pointed to remove_gid
+            keys_to_update = [k for k, v in self.radar_to_global_tid.items() if v == remove_gid]
+            for key in keys_to_update:
+                self.radar_to_global_tid[key] = keep_gid
+                if self.debug:
+                    self._log(f'    Remapped {key} -> GID {keep_gid}')
+            
+            # Merge EKF state: fuse the two filters
+            if remove_gid in self.filters and keep_gid in self.filters:
+                # Simple approach: keep the filter with lower covariance trace
+                # (more confident estimate)
+                keep_trace = np.trace(self.filters[keep_gid].P)
+                remove_trace = np.trace(self.filters[remove_gid].P)
+                
+                if remove_trace < keep_trace:
+                    # The removed filter is more confident - use its state
+                    self.filters[keep_gid].x = self.filters[remove_gid].x.copy()
+                    self.filters[keep_gid].P = self.filters[remove_gid].P.copy()
+                
+                # Delete the removed filter
+                del self.filters[remove_gid]
+            
+            # Clean up remove_gid from tracking dicts
+            if remove_gid in self.global_tid_last_seen:
+                del self.global_tid_last_seen[remove_gid]
+            if remove_gid in self.global_tid_last_ts:
+                del self.global_tid_last_ts[remove_gid]
+        
+        # Rebuild established_measurements with updated GIDs
+        new_established = []
+        for idx, old_gid in established_measurements:
+            track = all_tracks[idx]
+            key = (track['radar_name'], track['tid'])
+            new_gid = self.radar_to_global_tid.get(key, old_gid)
+            new_established.append((idx, new_gid))
+        
+        return new_established
 
     def _detect_conflict_zones(self, existing_track_positions):
         """
