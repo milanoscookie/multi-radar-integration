@@ -126,7 +126,7 @@ TRACK_FUSION_CFG = {
     # TRACK IDENTITY PRESERVATION (prevents merging when people get close)
     # Once a local track is associated with a global track, that association is LOCKED
     # until the track times out. New fusion only happens in "clear" areas.
-    'min_track_separation'    : 0.3,   # meters - if existing tracks are closer than 3x this,
+    'min_track_separation'    : 0.01,   # meters - if existing tracks are closer than 3x this,
                                         #          new measurements won't be cross-radar fused
     
     # TRACK SPLITTING (recovers from incorrect merges)

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
-from library.track_fusion import TrackFusion
+from library.track_fusion_pkg import TrackFusion
 
 
 class MatplotlibVisualizer:

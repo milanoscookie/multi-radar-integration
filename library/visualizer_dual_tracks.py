@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 import numpy as np
 
-from library.track_fusion import TrackFusion
+from library.track_fusion_pkg import TrackFusion
 
 
 class FuseDualRadar:
