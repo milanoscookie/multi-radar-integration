@@ -1,0 +1,7 @@
+# Requirements for Point Cloud Clustering
+# Add these to your existing requirements
+
+# Core ML/Scientific Computing
+scikit-learn>=1.0.0    # For DBSCAN clustering
+scipy>=1.7.0           # For distance calculations (cdist)
+numpy>=1.21.0          # Array operations

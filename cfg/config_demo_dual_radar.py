@@ -110,6 +110,26 @@ FRAME_POST_PROCESSOR_CFG = {
 }
 
 # =============================================================================
+# POINT CLOUD CLUSTERING CONFIG (DBSCAN-based object extraction)
+# =============================================================================
+POINTCLOUD_CLUSTERING_CFG = {
+    # DBSCAN parameters
+    'eps'                     : 0.5,   # meters - max distance between points in same cluster
+    'min_samples'             : 3,     # min points to form cluster core
+    'min_points_per_cluster'  : 3,     # min points to accept cluster
+    
+    # Physical filtering
+    'min_cluster_height'      : 0.3,   # meters - min human height
+    'max_cluster_height'      : 2.5,   # meters - max human height
+    'min_cluster_volume'      : 0.01,  # cubic meters
+    'max_cluster_volume'      : 5.0,   # cubic meters
+    
+    # Temporal tracking
+    'max_track_distance'      : 1.5,   # meters - max centroid movement between frames
+    'track_timeout'           : 1.0,   # seconds - drop track after no detections
+}
+
+# =============================================================================
 # TRACK FUSION CONFIG (EKF-CA Model with Track Identity Preservation)
 # =============================================================================
 TRACK_FUSION_CFG = {
