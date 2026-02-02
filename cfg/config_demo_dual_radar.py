@@ -127,6 +127,13 @@ POINTCLOUD_CLUSTERING_CFG = {
     # Temporal tracking
     'max_track_distance'      : 1.5,   # meters - max centroid movement between frames
     'track_timeout'           : 1.0,   # seconds - drop track after no detections
+    
+    # Frame synchronization (for multiple radars)
+    'frame_collection_timeout': 0.05,  # seconds - time window to collect frames from all radars
+    'sync_strategy'           : 'SYNC_WINDOW',  # 'LATEST', 'SYNC_WINDOW', or 'ALL_READY'
+    # - LATEST: Use whatever frames are available (lowest latency, may have desync)
+    # - SYNC_WINDOW: Collect frames within time window (balanced)
+    # - ALL_READY: Wait until all radars have data (highest sync, highest latency)
 }
 
 # =============================================================================
